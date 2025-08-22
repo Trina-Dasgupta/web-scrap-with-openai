@@ -1,0 +1,34 @@
+# Core web framework dependencies
+streamlit==1.28.1
+fastapi==0.104.1
+uvicorn==0.24.0
+requests==2.31.0
+beautifulsoup4==4.12.2
+python-dotenv==1.0.0
+lxml==4.9.3
+newspaper3k==0.2.8
+python-multipart==0.0.6
+
+# Pydantic v1 for compatibility
+pydantic==1.10.13
+
+# OpenAI (stable version)
+openai==0.28.1
+
+# Enhanced document processing
+PyPDF2==3.0.1
+python-docx==0.8.11
+openpyxl==3.1.2
+
+# Machine learning and text processing (no conflicts)
+scikit-learn>=1.0.0
+numpy>=1.21.0
+
+# Optional text processing
+nltk>=3.8
+
+# Optional evaluation (can be skipped if conflicts)
+# rouge-score==0.1.2
+
+# Utilities
+tqdm>=4.64.0
