@@ -26,7 +26,8 @@ numpy>=1.21.0
 
 # Optional text processing
 nltk>=3.8
-
+chromadb==0.4.15
+sentence-transformers==2.2.2
 # Optional evaluation (can be skipped if conflicts)
 # rouge-score==0.1.2
 

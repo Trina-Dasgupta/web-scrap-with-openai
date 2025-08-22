@@ -15,6 +15,11 @@ import json
 from datetime import datetime
 import math
 from collections import Counter, defaultdict
+# Add these imports after your existing imports
+import chromadb
+from chromadb.config import Settings
+from chromadb.utils import embedding_functions
+import uuid
 
 # Enhanced document processing
 import PyPDF2
@@ -118,170 +123,177 @@ class ConversationHistory:
             del self.history[session_id]
 
 # Enhanced document store with TF-IDF + OpenAI embeddings
-class HybridDocumentStore:
-    """Document store using both TF-IDF and OpenAI embeddings as fallback"""
+class ChromaDocumentStore:
+    """Enhanced document store using ChromaDB for vector storage"""
     
-    def __init__(self):
-        self.documents = []
-        self.tfidf_vectorizer = None
-        self.tfidf_matrix = None
-        self.openai_embeddings = {}
-        self.use_openai_embeddings = False
+    def __init__(self, persist_directory: str = "./chromadb_data"):
+        """Initialize ChromaDB client with persistence"""
+        self.persist_directory = persist_directory
         
-    def add_documents(self, docs, session_id="default"):
-        """Add documents and create search indices"""
-        self.documents = docs
-        self._build_tfidf_index()
-        self._check_openai_embeddings()
+        # Initialize ChromaDB client with persistence
+        self.client = chromadb.PersistentClient(
+            path=persist_directory,
+            settings=Settings(
+                allow_reset=True,
+                anonymized_telemetry=False
+            )
+        )
         
-    def _build_tfidf_index(self):
-        """Build TF-IDF index for documents"""
-        try:
-            texts = [doc['content'] for doc in self.documents]
-            self.tfidf_vectorizer = TfidfVectorizer(
-                max_features=5000,
-                stop_words='english',
-                ngram_range=(1, 2),
-                max_df=0.95,
-                min_df=2
-            )
-            self.tfidf_matrix = self.tfidf_vectorizer.fit_transform(texts)
-            logger.info(f"Built TF-IDF index with {self.tfidf_matrix.shape[1]} features")
-        except Exception as e:
-            logger.error(f"Error building TF-IDF index: {e}")
+        # Setup embedding function
+        self.embedding_function = self._setup_embedding_function()
+        
+        # Store collections by session
+        self.collections = {}
+        
+        logger.info(f"ChromaDB initialized with persistence at {persist_directory}")
     
-    def _check_openai_embeddings(self):
-        """Check if we can use OpenAI embeddings as backup"""
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        if openai_api_key and openai_api_key != "your_openai_api_key_here":
-            self.use_openai_embeddings = True
-            logger.info("OpenAI embeddings available as backup")
-    
-    def _get_openai_embedding(self, text: str) -> Optional[List[float]]:
-        """Get OpenAI embedding for text"""
-        if not self.use_openai_embeddings:
-            return None
-            
+    def _setup_embedding_function(self):
+        """Setup embedding function (sentence transformers or OpenAI)"""
         try:
-            import openai
-            openai.api_key = os.getenv("OPENAI_API_KEY")
-            
-            # Use OpenAI's embedding endpoint
-            response = openai.Embedding.create(
-                model="text-embedding-ada-002",
-                input=text[:8000]  # Limit text length
+            # Try to use sentence transformers first
+            embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
+                model_name="all-MiniLM-L6-v2"
             )
-            return response['data'][0]['embedding']
+            logger.info("Using SentenceTransformer embeddings (all-MiniLM-L6-v2)")
+            return embedding_function
+            
+        except ImportError:
+            logger.warning("SentenceTransformers not available, falling back to OpenAI")
+            
+            # Fallback to OpenAI embeddings
+            openai_api_key = os.getenv("OPENAI_API_KEY")
+            if openai_api_key and openai_api_key != "your_openai_api_key_here":
+                embedding_function = embedding_functions.OpenAIEmbeddingFunction(
+                    api_key=openai_api_key,
+                    model_name="text-embedding-ada-002"
+                )
+                logger.info("Using OpenAI embeddings (text-embedding-ada-002)")
+                return embedding_function
+            
+            # Ultimate fallback to default
+            logger.warning("No embedding service configured, using default")
+            return embedding_functions.DefaultEmbeddingFunction()
+    
+    def create_collection(self, session_id: str, reset_if_exists: bool = True):
+        """Create or get a collection for a session"""
+        collection_name = f"session_{session_id}".replace("-", "_")
+        
+        try:
+            if reset_if_exists:
+                # Delete existing collection if it exists
+                try:
+                    self.client.delete_collection(collection_name)
+                    logger.info(f"Deleted existing collection: {collection_name}")
+                except Exception:
+                    pass  # Collection didn't exist
+            
+            # Create new collection
+            collection = self.client.create_collection(
+                name=collection_name,
+                embedding_function=self.embedding_function,
+                metadata={"session_id": session_id, "created_at": datetime.now().isoformat()}
+            )
+            
+            self.collections[session_id] = collection
+            logger.info(f"Created ChromaDB collection: {collection_name}")
+            return collection
+            
         except Exception as e:
-            logger.warning(f"OpenAI embedding failed: {e}")
-            return None
+            logger.error(f"Error creating collection: {e}")
+            # Try to get existing collection
+            try:
+                collection = self.client.get_collection(
+                    name=collection_name,
+                    embedding_function=self.embedding_function
+                )
+                self.collections[session_id] = collection
+                logger.info(f"Retrieved existing collection: {collection_name}")
+                return collection
+            except Exception as e2:
+                logger.error(f"Error retrieving collection: {e2}")
+                raise e
+    
+    def add_documents(self, documents, session_id="default"):
+        """Add documents to ChromaDB collection"""
+        try:
+            # Get or create collection
+            if session_id not in self.collections:
+                self.create_collection(session_id)
+            
+            collection = self.collections[session_id]
+            
+            # Prepare data for ChromaDB
+            doc_texts = []
+            doc_metadatas = []
+            doc_ids = []
+            
+            for i, doc in enumerate(documents):
+                doc_id = f"{session_id}_{i}_{uuid.uuid4().hex[:8]}"
+                
+                doc_texts.append(doc['content'])
+                doc_metadatas.append({
+                    'source': doc.get('source', 'unknown'),
+                    'chunk_id': doc.get('id', i),
+                    'word_count': len(doc['content'].split()),
+                    'char_count': len(doc['content']),
+                    'added_at': datetime.now().isoformat()
+                })
+                doc_ids.append(doc_id)
+            
+            # Add to ChromaDB (embeddings generated automatically)
+            collection.add(
+                documents=doc_texts,
+                metadatas=doc_metadatas,
+                ids=doc_ids
+            )
+            
+            logger.info(f"Added {len(documents)} documents to ChromaDB collection")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error adding documents to ChromaDB: {e}")
+            return False
     
     def search(self, query, k=3):
-        """Search using TF-IDF with OpenAI embeddings as fallback"""
-        # Primary search with TF-IDF
-        tfidf_results = self._tfidf_search(query, k)
-        
-        if tfidf_results and any(doc.get('similarity_score', 0) > 0.1 for doc in tfidf_results):
-            return tfidf_results
-        
-        # Fallback to OpenAI embeddings if TF-IDF results are poor
-        if self.use_openai_embeddings:
-            openai_results = self._openai_embedding_search(query, k)
-            if openai_results:
-                logger.info("Using OpenAI embeddings fallback")
-                return openai_results
-        
-        return tfidf_results or []
+        """Search documents using ChromaDB semantic search"""
+        # Keep the same method signature for compatibility
+        return self.search_advanced("default", query, k)
     
-    def _tfidf_search(self, query, k=3):
-        """Search using TF-IDF similarity"""
-        if self.tfidf_vectorizer is None or self.tfidf_matrix is None:
-            return self._simple_keyword_search(query, k)
-        
+    def search_advanced(self, session_id, query, k=3, filters=None):
+        """Advanced search with session and filters"""
         try:
-            # Transform query using the same vectorizer
-            query_vector = self.tfidf_vectorizer.transform([query])
+            if session_id not in self.collections:
+                logger.warning(f"No collection found for session {session_id}")
+                return []
             
-            # Calculate cosine similarity
-            similarities = cosine_similarity(query_vector, self.tfidf_matrix).flatten()
+            collection = self.collections[session_id]
             
-            # Get top k documents
-            top_indices = similarities.argsort()[-k:][::-1]
+            # Perform semantic search
+            results = collection.query(
+                query_texts=[query],
+                n_results=k,
+                where=filters  # Optional metadata filtering
+            )
             
-            results = []
-            for idx in top_indices:
-                if similarities[idx] > 0:  # Only return docs with some similarity
-                    doc = self.documents[idx].copy()
-                    doc['similarity_score'] = float(similarities[idx])
-                    results.append(doc)
+            # Format results to match existing interface
+            formatted_results = []
             
-            return results
+            if results['documents'] and results['documents'][0]:
+                for i in range(len(results['documents'][0])):
+                    result = {
+                        'id': results['ids'][0][i],
+                        'content': results['documents'][0][i],
+                        'similarity_score': 1.0 - results['distances'][0][i],  # Convert distance to similarity
+                        'source': results['metadatas'][0][i].get('source', 'unknown') if results['metadatas'][0] else 'unknown'
+                    }
+                    formatted_results.append(result)
+            
+            logger.info(f"ChromaDB search returned {len(formatted_results)} results")
+            return formatted_results
+            
         except Exception as e:
-            logger.error(f"TF-IDF search failed: {e}")
-            return self._simple_keyword_search(query, k)
-    
-    def _openai_embedding_search(self, query, k=3):
-        """Search using OpenAI embeddings"""
-        query_embedding = self._get_openai_embedding(query)
-        if query_embedding is None:
+            logger.error(f"Error searching ChromaDB: {e}")
             return []
-        
-        # Get embeddings for all documents (cache them)
-        doc_embeddings = []
-        for i, doc in enumerate(self.documents):
-            doc_id = f"doc_{i}"
-            if doc_id not in self.openai_embeddings:
-                embedding = self._get_openai_embedding(doc['content'][:8000])
-                if embedding:
-                    self.openai_embeddings[doc_id] = embedding
-                else:
-                    continue
-            doc_embeddings.append((i, self.openai_embeddings[doc_id]))
-        
-        if not doc_embeddings:
-            return []
-        
-        # Calculate similarities
-        similarities = []
-        for doc_idx, doc_embedding in doc_embeddings:
-            similarity = self._cosine_similarity(query_embedding, doc_embedding)
-            similarities.append((doc_idx, similarity))
-        
-        # Sort by similarity and return top k
-        similarities.sort(key=lambda x: x[1], reverse=True)
-        
-        results = []
-        for doc_idx, similarity in similarities[:k]:
-            if similarity > 0.5:  # Threshold for meaningful similarity
-                doc = self.documents[doc_idx].copy()
-                doc['similarity_score'] = float(similarity)
-                results.append(doc)
-        
-        return results
-    
-    def _cosine_similarity(self, vec1, vec2):
-        """Calculate cosine similarity between two vectors"""
-        vec1, vec2 = np.array(vec1), np.array(vec2)
-        return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
-    
-    def _simple_keyword_search(self, query, k=3):
-        """Simple keyword-based search fallback"""
-        query_words = set(query.lower().split())
-        scored_docs = []
-        
-        for doc in self.documents:
-            content_words = set(doc['content'].lower().split())
-            overlap = len(query_words.intersection(content_words))
-            score = overlap / len(query_words) if query_words else 0
-            
-            if score > 0:
-                doc_copy = doc.copy()
-                doc_copy['similarity_score'] = score
-                scored_docs.append(doc_copy)
-        
-        scored_docs.sort(key=lambda x: x['similarity_score'], reverse=True)
-        return scored_docs[:k]
-
 # Advanced text chunking
 class SemanticChunker:
     """Advanced text chunking based on semantic boundaries"""
@@ -428,6 +440,7 @@ class RAGEvaluator:
 
 # Global instances
 document_stores = {}
+chroma_store = ChromaDocumentStore()
 conversation_history = ConversationHistory()
 evaluator = RAGEvaluator()
 
@@ -627,8 +640,10 @@ async def scrape_website(request: URLRequest):
             })
         
         session_id = "default"
-        document_stores[session_id] = HybridDocumentStore()
-        document_stores[session_id].add_documents(documents, session_id)
+        success = chroma_store.add_documents(documents, session_id)
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to index documents in ChromaDB")
         
         conversation_history.clear_session(session_id)
         
@@ -695,8 +710,10 @@ async def upload_document(file: UploadFile = File(...)):
             })
         
         session_id = "default"
-        document_stores[session_id] = HybridDocumentStore()
-        document_stores[session_id].add_documents(documents, session_id)
+        success = chroma_store.add_documents(documents, session_id)
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to index documents in ChromaDB")
         
         conversation_history.clear_session(session_id)
         
@@ -725,16 +742,15 @@ async def ask_question_enhanced(request: QuestionRequest):
     try:
         session_id = request.session_id or "default"
         logger.info(f"Processing enhanced question: {request.question}")
-        
-        if session_id not in document_stores:
+        # Check if collection exists
+        if session_id not in chroma_store.collections:
             return AnswerResponse(
                 answer="No content has been scraped yet. Please scrape a URL or upload a document first.",
                 sources=[],
                 session_id=session_id
             )
         
-        store = document_stores[session_id]
-        relevant_docs = store.search(request.question, k=4)
+        relevant_docs = chroma_store.search_advanced(session_id, request.question, k=4)
         logger.info(f"Found {len(relevant_docs)} relevant documents using hybrid search")
         
         if not relevant_docs:
@@ -796,11 +812,20 @@ async def get_conversation_history(session_id: str = "default"):
 
 @app.get("/health")
 async def health_check():
-    """Enhanced health check"""
+    """Enhanced health check with ChromaDB status"""
+    try:
+        # Test ChromaDB connection
+        collections = chroma_store.client.list_collections()
+        chromadb_status = "connected"
+        collection_count = len(collections)
+    except Exception as e:
+        chromadb_status = f"error: {str(e)}"
+        collection_count = 0
+    
     # Check available features
     features_status = {
-        "tfidf_search": "available",
-        "openai_embeddings": "available" if os.getenv("OPENAI_API_KEY") else "requires_api_key",
+        "chromadb": chromadb_status,
+        "embedding_function": str(type(chroma_store.embedding_function).__name__),
         "conversation_memory": "enabled",
         "nltk": "available" if NLTK_AVAILABLE else "fallback_regex",
         "document_processing": "available"
@@ -808,25 +833,29 @@ async def health_check():
     
     return {
         "status": "healthy", 
-        "search_method": "Hybrid TF-IDF + OpenAI Embeddings",
+        "search_method": "ChromaDB Vector Database",
         "features": features_status,
+        "collections": collection_count,
         "supported_formats": ["web_pages", "pdf", "docx", "xlsx", "txt", "md"],
-        "version": "2.0.0"
+        "version": "2.0.0 + ChromaDB"
     }
-
 @app.delete("/clear/{session_id}")
 async def clear_session_enhanced(session_id: str = "default"):
-    """Clear session with conversation history"""
-    if session_id in document_stores:
-        try:
-            del document_stores[session_id]
-            conversation_history.clear_session(session_id)
-            return {"message": f"Session {session_id} and conversation history cleared successfully"}
-        except Exception as e:
-            logger.error(f"Error clearing session: {e}")
-            return {"message": f"Error clearing session {session_id}: {str(e)}"}
-    return {"message": f"Session {session_id} not found"}
-
+    """Clear session with ChromaDB"""
+    try:
+        # Delete from ChromaDB
+        if session_id in chroma_store.collections:
+            collection_name = f"session_{session_id}".replace("-", "_")
+            chroma_store.client.delete_collection(collection_name)
+            del chroma_store.collections[session_id]
+        
+        # Clear conversation history
+        conversation_history.clear_session(session_id)
+        
+        return {"message": f"Session {session_id} cleared from ChromaDB and conversation history"}
+    except Exception as e:
+        logger.error(f"Error clearing session: {e}")
+        return {"message": f"Error clearing session {session_id}: {str(e)}"}
 @app.get("/sessions")
 async def list_sessions_enhanced():
     """List all active sessions with stats"""
