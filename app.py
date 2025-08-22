@@ -8,6 +8,8 @@ import time
 import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
+import websocket
+import threading
 
 # Configure page
 st.set_page_config(
@@ -972,6 +974,47 @@ def scrape_website(url: str):
         else:
             return False, result["error"] if "error" in result else "Unknown error occurred"
 
-# The rest of the code remains the same as provided in the original message
+# In your Streamlit app.py, update the API endpoints:
 
-# ... (the rest of the original code continues)
+def get_analytics():
+    """Get analytics from FastAPI backend"""
+    result = make_api_request("/analytics")
+    if result["success"]:
+        return result["data"]
+    return {
+        "total_sessions": 0,
+        "total_documents": 0,
+        "total_questions": 0,
+        "cache_hits": 0,
+        "session_stats": {},
+        "daily_usage": []
+    }
+
+# Update your analytics display section:
+analytics_data = get_analytics()
+
+# Use analytics_data instead of st.session_state for the metrics:
+st.markdown('<div class="score-card"><h3>📝</h3><p>Total Questions</p><h2>{}</h2></div>'.format(analytics_data["total_questions"]), unsafe_allow_html=True)
+
+
+def on_message(ws, message):
+    data = json.loads(message)
+    if data["type"] == "answer":
+        st.session_state.messages.append({
+            "role": "assistant", 
+            "content": data["answer"]
+        })
+        st.rerun()
+
+def start_websocket():
+    ws = websocket.WebSocketApp(
+        "ws://localhost:8000/ws/chat",
+        on_message=on_message
+    )
+    ws.run_forever()
+
+# Start WebSocket in a thread
+if "ws_thread" not in st.session_state:
+    st.session_state.ws_thread = threading.Thread(target=start_websocket)
+    st.session_state.ws_thread.daemon = True
+    st.session_state.ws_thread.start()

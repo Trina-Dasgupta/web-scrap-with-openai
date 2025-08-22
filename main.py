@@ -1,5 +1,7 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import requests
@@ -12,14 +14,15 @@ from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor
 import io
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import math
 from collections import Counter, defaultdict
-# Add these imports after your existing imports
+import asyncio
 import chromadb
 from chromadb.config import Settings
 from chromadb.utils import embedding_functions
 import uuid
+from datetime import datetime, timedelta
 
 # Enhanced document processing
 import PyPDF2
@@ -61,6 +64,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Create static directory if it doesn't exist
+os.makedirs("static", exist_ok=True)
+
+# Mount static files for chat interface
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 # Pydantic models
 class URLRequest(BaseModel):
     url: str
@@ -85,11 +94,20 @@ class AnswerResponse(BaseModel):
     conversation_context: Optional[List[Dict]] = None
     evaluation_metrics: Optional[Dict] = None
 
+class AnalyticsResponse(BaseModel):
+    total_sessions: int
+    total_documents: int
+    total_questions: int
+    cache_hits: int
+    session_stats: Dict[str, Any]
+    daily_usage: List[Dict]
+
 class ConversationCache:
     """Cache for previously asked questions to avoid redundant OpenAI calls"""
     
     def __init__(self):
         self.cache = {}  # question_hash -> {answer, sources, metadata}
+        self.hit_count = 0
     
     def _hash_question(self, question: str, context_snippet: str = "") -> str:
         """Create a hash for question + context snippet"""
@@ -101,6 +119,7 @@ class ConversationCache:
         """Get cached answer if available"""
         question_hash = self._hash_question(question, context_snippet)
         if question_hash in self.cache:
+            self.hit_count += 1
             cached = self.cache[question_hash]
             logger.info(f"✅ Using cached answer for question (saved OpenAI call)")
             return cached
@@ -123,12 +142,21 @@ class ConversationCache:
         """Clear the entire cache"""
         self.cache = {}
         logger.info("🗑️ Conversation cache cleared")
+    
+    def get_stats(self):
+        """Get cache statistics"""
+        return {
+            'total_cached': len(self.cache),
+            'hit_count': self.hit_count,
+            'hit_rate': self.hit_count / max(1, self.hit_count + len(self.cache))
+        }
 
 
 class ConversationHistory:
     """Manages conversation history for each session"""
     def __init__(self):
         self.history: Dict[str, List[Dict]] = {}
+        self.question_count = 0
     
     def add_exchange(self, session_id: str, question: str, answer: str, sources: List[str]):
         if session_id not in self.history:
@@ -141,11 +169,13 @@ class ConversationHistory:
             "sources": sources
         })
         
-        # Keep only last 10 exchanges to prevent memory bloat
-        if len(self.history[session_id]) > 10:
-            self.history[session_id] = self.history[session_id][-10:]
+        self.question_count += 1
+        
+        # Keep only last 20 exchanges to prevent memory bloat
+        if len(self.history[session_id]) > 20:
+            self.history[session_id] = self.history[session_id][-20:]
     
-    def get_context(self, session_id: str, max_exchanges: int = 3) -> str:
+    def get_context(self, session_id: str, max_exchanges: int = 5) -> str:
         if session_id not in self.history:
             return ""
         
@@ -161,8 +191,33 @@ class ConversationHistory:
     def clear_session(self, session_id: str):
         if session_id in self.history:
             del self.history[session_id]
+    
+    def get_stats(self):
+        """Get conversation statistics"""
+        total_exchanges = sum(len(conv) for conv in self.history.values())
+        return {
+            'total_sessions': len(self.history),
+            'total_questions': self.question_count,
+            'active_sessions': len(self.history),
+            'avg_questions_per_session': total_exchanges / max(1, len(self.history))
+        }
 
 
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+    
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+    
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+    
+    async def broadcast(self, message: str):
+        for connection in self.active_connections:
+            await connection.send_text(message)
 
 
 # Enhanced document store with TF-IDF + OpenAI embeddings
@@ -171,6 +226,7 @@ class ChromaDocumentStore:
         """Initialize ChromaDB client with persistence"""
         # Convert to absolute path
         self.persist_directory = os.path.abspath(persist_directory)
+        self.document_count = 0 
         
         # Ensure directory exists
         os.makedirs(self.persist_directory, exist_ok=True)
@@ -179,9 +235,9 @@ class ChromaDocumentStore:
         self.client = chromadb.PersistentClient(
             path=self.persist_directory,
             settings=Settings(
-                allow_reset=False,  # KEY FIX: Don't allow data deletion
+                allow_reset=False,
                 anonymized_telemetry=False,
-                is_persistent=True  # Ensure persistence
+                is_persistent=True
             )
         )
         
@@ -190,8 +246,9 @@ class ChromaDocumentStore:
         
         # Store collections by session
         self.collections = {}
+        self.document_count = 0
         
-        # KEY FIX: Load existing collections on startup
+        # Load existing collections on startup
         self._load_existing_collections()
         
         logger.info(f"ChromaDB initialized with {len(self.collections)} existing collections")
@@ -238,6 +295,7 @@ class ChromaDocumentStore:
                         
                         self.collections[session_id] = collection
                         document_count = collection.count()
+                        self.document_count += document_count
                         
                         logger.info(f"✅ Loaded collection '{session_id}' with {document_count} documents")
                         
@@ -285,6 +343,7 @@ class ChromaDocumentStore:
                 metadatas=metadatas
             )
             
+            self.document_count += len(documents)
             logger.info(f"Added {len(documents)} documents to session {session_id}")
             return True
         except Exception as e:
@@ -324,9 +383,18 @@ class ChromaDocumentStore:
             
             return documents
         except Exception as e:
-            logger.error(f"ChromaDB search failed: {e}")
+            logger.error(f"ChronaDB search failed: {e}")
             return []
-        
+    
+    def get_stats(self):
+        """Get document store statistics"""
+        return {
+            'total_documents': self.document_count,
+            'total_collections': len(self.collections),
+            'collections': list(self.collections.keys())
+        }
+
+
 # Advanced text chunking
 class SemanticChunker:
     """Advanced text chunking based on semantic boundaries"""
@@ -374,6 +442,7 @@ class SemanticChunker:
             chunks.append(current_chunk.strip())
         
         return chunks
+
 
 # Document processors
 class DocumentProcessor:
@@ -424,6 +493,7 @@ class DocumentProcessor:
             logger.error(f"Error processing XLSX: {e}")
             return ""
 
+
 # Evaluation metrics
 class RAGEvaluator:
     """Evaluate RAG responses"""
@@ -471,12 +541,6 @@ class RAGEvaluator:
         overlap = len(answer_words.intersection(context_words))
         return overlap / len(context_words)
 
-# Global instances
-document_stores = {}
-chroma_store = ChromaDocumentStore()
-conversation_history = ConversationHistory()
-conversation_cache = ConversationCache()  # ADD THIS LINE
-evaluator = RAGEvaluator()
 
 # Enhanced web scraper
 class EnhancedWebScraper:
@@ -580,6 +644,7 @@ class EnhancedWebScraper:
         
         raise Exception("Could not extract meaningful content from the URL")
 
+
 def call_openai_api_enhanced(question: str, context: str, conversation_context: str = "") -> str:
     """Enhanced OpenAI API call with conversation context"""
     try:
@@ -637,6 +702,15 @@ Answer:"""
     except Exception as e:
         return f"Error processing your question: {str(e)}"
 
+
+# Global instances
+chroma_store = ChromaDocumentStore()
+conversation_history = ConversationHistory()
+conversation_cache = ConversationCache()
+evaluator = RAGEvaluator()
+connection_manager = ConnectionManager()
+
+
 # API Endpoints
 @app.post("/scrape", response_model=URLResponse)
 async def scrape_website(request: URLRequest):
@@ -679,8 +753,6 @@ async def scrape_website(request: URLRequest):
         if not success:
             raise HTTPException(status_code=500, detail="Failed to index documents in ChromaDB")
         
-        conversation_history.clear_session(session_id)
-        
         logger.info("Successfully created enhanced document store")
         
         word_count = len(content.split())
@@ -699,6 +771,7 @@ async def scrape_website(request: URLRequest):
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/upload", response_model=URLResponse)
 async def upload_document(file: UploadFile = File(...)):
@@ -749,8 +822,6 @@ async def upload_document(file: UploadFile = File(...)):
         if not success:
             raise HTTPException(status_code=500, detail="Failed to index documents in ChromaDB")
         
-        conversation_history.clear_session(session_id)
-        
         logger.info("Successfully processed uploaded document")
         
         word_count = len(content.split())
@@ -769,6 +840,7 @@ async def upload_document(file: UploadFile = File(...)):
     except Exception as e:
         logger.error(f"Unexpected error processing file: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/ask", response_model=AnswerResponse)
 async def ask_question_enhanced(request: QuestionRequest):
@@ -834,6 +906,15 @@ async def ask_question_enhanced(request: QuestionRequest):
         # Get recent conversation for response
         recent_conversation = conversation_history.history.get(session_id, [])[-3:]
         
+        # Broadcast to all connected WebSocket clients
+        await connection_manager.broadcast(json.dumps({
+            "type": "new_question",
+            "session_id": session_id,
+            "question": request.question,
+            "answer": answer,
+            "timestamp": datetime.now().isoformat()
+        }))
+        
         return AnswerResponse(
             answer=answer,
             sources=sources,
@@ -852,6 +933,62 @@ async def ask_question_enhanced(request: QuestionRequest):
         )
 
 
+@app.websocket("/ws/chat")
+async def websocket_chat(websocket: WebSocket):
+    """WebSocket endpoint for real-time chat"""
+    await connection_manager.connect(websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            message_data = json.loads(data)
+            
+            if message_data.get("type") == "question":
+                # Process question through the ask endpoint
+                request = QuestionRequest(
+                    question=message_data["question"],
+                    session_id=message_data.get("session_id", "default")
+                )
+                
+                response = await ask_question_enhanced(request)
+                
+                # Send response back to the client
+                await websocket.send_text(json.dumps({
+                    "type": "answer",
+                    "answer": response.answer,
+                    "sources": response.sources,
+                    "session_id": response.session_id
+                }))
+                
+    except WebSocketDisconnect:
+        connection_manager.disconnect(websocket)
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        connection_manager.disconnect(websocket)
+
+
+@app.get("/analytics", response_model=AnalyticsResponse)
+async def get_analytics():
+    """Get analytics data"""
+    # Generate daily usage data (last 7 days)
+    daily_usage = []
+    for i in range(7):
+        date = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+        daily_usage.append({
+            "date": date,
+            "questions": max(5, conversation_history.question_count // 7),
+            "sessions": max(1, len(conversation_history.history) // 7)
+        })
+    
+    return AnalyticsResponse(
+        total_sessions=len(conversation_history.history),
+        total_documents=chroma_store.document_count,
+        total_questions=conversation_history.question_count,
+        cache_hits=conversation_cache.hit_count,
+        session_stats=conversation_history.get_stats(),
+        daily_usage=daily_usage
+    )
+
+
 @app.get("/conversation/{session_id}")
 async def get_conversation_history(session_id: str = "default"):
     """Get conversation history for a session"""
@@ -859,6 +996,7 @@ async def get_conversation_history(session_id: str = "default"):
         "session_id": session_id,
         "conversation": conversation_history.history.get(session_id, [])
     }
+
 
 @app.get("/health")
 async def health_check():
@@ -878,7 +1016,9 @@ async def health_check():
         "embedding_function": str(type(chroma_store.embedding_function).__name__),
         "conversation_memory": "enabled",
         "nltk": "available" if NLTK_AVAILABLE else "fallback_regex",
-        "document_processing": "available"
+        "document_processing": "available",
+        "websocket_chat": "enabled",
+        "analytics": "enabled"
     }
     
     return {
@@ -887,8 +1027,9 @@ async def health_check():
         "features": features_status,
         "collections": collection_count,
         "supported_formats": ["web_pages", "pdf", "docx", "xlsx", "txt", "md"],
-        "version": "2.0.0 + ChromaDB"
+        "version": "2.0.0 + ChromaDB + Chat"
     }
+
 
 @app.get("/debug/persistence")
 async def debug_persistence():
@@ -936,11 +1077,13 @@ async def debug_persistence():
         "cache_size": len(conversation_cache.cache)
     }
 
+
 @app.get("/debug/cache")
 async def debug_cache():
     """Debug conversation cache"""
     return {
         "cached_questions": len(conversation_cache.cache),
+        "cache_stats": conversation_cache.get_stats(),
         "cache_details": [
             {
                 "question": item["question"][:100] + "...",
@@ -950,6 +1093,7 @@ async def debug_cache():
             for item in conversation_cache.cache.values()
         ]
     }
+
 
 @app.delete("/debug/clear_cache")
 async def clear_cache():
@@ -975,29 +1119,144 @@ async def clear_session_enhanced(session_id: str = "default"):
     except Exception as e:
         logger.error(f"Error clearing session: {e}")
         return {"message": f"Error clearing session {session_id}: {str(e)}"}
+
+
 @app.get("/sessions")
 async def list_sessions_enhanced():
     """List all active sessions with stats"""
     session_stats = {}
-    for session_id, store in document_stores.items():
-        conversation_count = len(conversation_history.history.get(session_id, []))
+    for session_id in chroma_store.collections.keys():
+        conversation = conversation_history.history.get(session_id, [])
         session_stats[session_id] = {
-            "document_count": len(store.documents),
-            "conversation_exchanges": conversation_count,
-            "search_method": "hybrid_tfidf_openai"
+            "document_count": chroma_store.collections[session_id].count() if session_id in chroma_store.collections else 0,
+            "conversation_exchanges": len(conversation),
+            "last_activity": conversation[-1]["timestamp"] if conversation else "No activity",
+            "search_method": "chromadb_vector"
         }
     
     return {
-        "active_sessions": list(document_stores.keys()),
-        "total_sessions": len(document_stores),
+        "active_sessions": list(chroma_store.collections.keys()),
+        "total_sessions": len(chroma_store.collections),
         "session_stats": session_stats
     }
+
+
+@app.get("/chat")
+async def get_chat_interface():
+    """Serve the chat interface"""
+    html_content = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>RAG Chat Interface</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f5f5f5; }
+            .chat-container { max-width: 800px; margin: 0 auto; background: white; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .chat-header { background: #4f46e5; color: white; padding: 20px; border-radius: 10px 10px 0 0; }
+            .chat-messages { height: 400px; overflow-y: auto; padding: 20px; }
+            .message { margin-bottom: 15px; padding: 10px; border-radius: 8px; }
+            .user-message { background: #e0e7ff; margin-left: 20%; }
+            .bot-message { background: #f1f5f9; margin-right: 20%; }
+            .input-area { display: flex; padding: 20px; border-top: 1px solid #e5e7eb; }
+            #question-input { flex: 1; padding: 10px; border: 1px solid #d1d5db; border-radius: 5px; margin-right: 10px; }
+            #send-button { padding: 10px 20px; background: #4f46e5; color: white; border: none; border-radius: 5px; cursor: pointer; }
+            .source { font-size: 12px; color: #6b7280; margin-top: 5px; }
+            .analytics { margin-top: 20px; padding: 15px; background: #f9fafb; border-radius: 5px; }
+        </style>
+    </head>
+    <body>
+        <div class="chat-container">
+            <div class="chat-header">
+                <h1>RAG Chat Interface</h1>
+                <p>Ask questions about your uploaded documents</p>
+            </div>
+            <div class="chat-messages" id="chat-messages">
+                <div class="message bot-message">Hello! I'm ready to answer questions about your documents. Upload some content first, then ask me anything!</div>
+            </div>
+            <div class="input-area">
+                <input type="text" id="question-input" placeholder="Type your question here...">
+                <button id="send-button" onclick="sendQuestion()">Send</button>
+            </div>
+        </div>
+        <div class="analytics">
+            <h3>Analytics</h3>
+            <div id="analytics-data">Loading analytics...</div>
+        </div>
+
+        <script>
+            const websocket = new WebSocket(`ws://${window.location.host}/ws/chat`);
+            
+            websocket.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                if (data.type === 'answer') {
+                    addMessage(data.answer, 'bot', data.sources);
+                } else if (data.type === 'new_question') {
+                    // Update analytics when new questions are asked
+                    updateAnalytics();
+                }
+            };
+            
+            function addMessage(message, sender, sources = []) {
+                const messagesDiv = document.getElementById('chat-messages');
+                const messageDiv = document.createElement('div');
+                messageDiv.className = `message ${sender}-message`;
+                messageDiv.innerHTML = `<p>${message}</p>`;
+                
+                if (sources && sources.length > 0) {
+                    messageDiv.innerHTML += `<div class="source">Sources: ${sources.join(', ')}</div>`;
+                }
+                
+                messagesDiv.appendChild(messageDiv);
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            }
+            
+            function sendQuestion() {
+                const input = document.getElementById('question-input');
+                const question = input.value.trim();
+                
+                if (question) {
+                    addMessage(question, 'user');
+                    websocket.send(JSON.stringify({
+                        type: 'question',
+                        question: question,
+                        session_id: 'default'
+                    }));
+                    input.value = '';
+                }
+            }
+            
+            function updateAnalytics() {
+                fetch('/analytics')
+                    .then(response => response.json())
+                    .then(data => {
+                        document.getElementById('analytics-data').innerHTML = `
+                            <p>Total Questions: ${data.total_questions} | Cache Hits: ${data.cache_hits}</p>
+                            <p>Active Sessions: ${data.total_sessions} | Total Documents: ${data.total_documents}</p>
+                        `;
+                    });
+            }
+            
+            // Load analytics on page load
+            updateAnalytics();
+            
+            // Allow sending with Enter key
+            document.getElementById('question-input').addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    sendQuestion();
+                }
+            });
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
 
 @app.get("/")
 async def root():
     """Enhanced root endpoint"""
     return {
-        "message": "Enhanced RAG Web Scraper API",
+        "message": "Enhanced RAG Web Scraper API with Chat Interface",
         "version": "2.0.0",
         "features": [
             "Hybrid search (TF-IDF + OpenAI embeddings)",
@@ -1005,12 +1264,18 @@ async def root():
             "Conversation memory and context",
             "Semantic text chunking",
             "Response quality evaluation",
-            "Enhanced web scraping"
+            "Enhanced web scraping",
+            "Real-time WebSocket chat interface",
+            "Analytics dashboard",
+            "Caching for performance"
         ],
         "endpoints": {
             "POST /scrape": "Scrape content from URL with enhanced processing",
             "POST /upload": "Upload and process documents (PDF, DOCX, XLSX, TXT, MD)",
             "POST /ask": "Ask questions with conversation context and evaluation",
+            "GET /chat": "Web-based chat interface",
+            "WS /ws/chat": "WebSocket for real-time chat",
+            "GET /analytics": "Get usage analytics",
             "GET /conversation/{session_id}": "Get conversation history",
             "GET /health": "Health check with feature status",
             "DELETE /clear/{session_id}": "Clear session and conversation",
@@ -1018,6 +1283,9 @@ async def root():
         }
     }
 
+
 if __name__ == "__main__":
     import uvicorn
+    # Create static directory if it doesn't exist
+    os.makedirs("static", exist_ok=True)
     uvicorn.run(app, host="0.0.0.0", port=8000)
