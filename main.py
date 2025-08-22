@@ -85,6 +85,46 @@ class AnswerResponse(BaseModel):
     conversation_context: Optional[List[Dict]] = None
     evaluation_metrics: Optional[Dict] = None
 
+class ConversationCache:
+    """Cache for previously asked questions to avoid redundant OpenAI calls"""
+    
+    def __init__(self):
+        self.cache = {}  # question_hash -> {answer, sources, metadata}
+    
+    def _hash_question(self, question: str, context_snippet: str = "") -> str:
+        """Create a hash for question + context snippet"""
+        import hashlib
+        combined = f"{question.lower().strip()}_{context_snippet[:200]}"
+        return hashlib.md5(combined.encode()).hexdigest()
+    
+    def get_cached_answer(self, question: str, context_snippet: str = "") -> Optional[Dict]:
+        """Get cached answer if available"""
+        question_hash = self._hash_question(question, context_snippet)
+        if question_hash in self.cache:
+            cached = self.cache[question_hash]
+            logger.info(f"✅ Using cached answer for question (saved OpenAI call)")
+            return cached
+        return None
+    
+    def cache_answer(self, question: str, answer: str, sources: List[str], 
+                    context_snippet: str = "", metadata: Dict = None):
+        """Cache an answer for future use"""
+        question_hash = self._hash_question(question, context_snippet)
+        self.cache[question_hash] = {
+            'answer': answer,
+            'sources': sources,
+            'metadata': metadata or {},
+            'cached_at': datetime.now().isoformat(),
+            'question': question
+        }
+        logger.info(f"💾 Cached answer for future use")
+    
+    def clear_cache(self):
+        """Clear the entire cache"""
+        self.cache = {}
+        logger.info("🗑️ Conversation cache cleared")
+
+
 class ConversationHistory:
     """Manages conversation history for each session"""
     def __init__(self):
@@ -122,20 +162,26 @@ class ConversationHistory:
         if session_id in self.history:
             del self.history[session_id]
 
+
+
+
 # Enhanced document store with TF-IDF + OpenAI embeddings
 class ChromaDocumentStore:
-    """Enhanced document store using ChromaDB for vector storage"""
-    
     def __init__(self, persist_directory: str = "./chromadb_data"):
         """Initialize ChromaDB client with persistence"""
-        self.persist_directory = persist_directory
+        # Convert to absolute path
+        self.persist_directory = os.path.abspath(persist_directory)
+        
+        # Ensure directory exists
+        os.makedirs(self.persist_directory, exist_ok=True)
         
         # Initialize ChromaDB client with persistence
         self.client = chromadb.PersistentClient(
-            path=persist_directory,
+            path=self.persist_directory,
             settings=Settings(
-                allow_reset=True,
-                anonymized_telemetry=False
+                allow_reset=False,  # KEY FIX: Don't allow data deletion
+                anonymized_telemetry=False,
+                is_persistent=True  # Ensure persistence
             )
         )
         
@@ -145,155 +191,142 @@ class ChromaDocumentStore:
         # Store collections by session
         self.collections = {}
         
-        logger.info(f"ChromaDB initialized with persistence at {persist_directory}")
+        # KEY FIX: Load existing collections on startup
+        self._load_existing_collections()
+        
+        logger.info(f"ChromaDB initialized with {len(self.collections)} existing collections")
     
     def _setup_embedding_function(self):
-        """Setup embedding function (sentence transformers or OpenAI)"""
+        """Setup the embedding function for ChromaDB"""
         try:
-            # Try to use sentence transformers first
-            embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
-                model_name="all-MiniLM-L6-v2"
-            )
-            logger.info("Using SentenceTransformer embeddings (all-MiniLM-L6-v2)")
-            return embedding_function
-            
-        except ImportError:
-            logger.warning("SentenceTransformers not available, falling back to OpenAI")
-            
-            # Fallback to OpenAI embeddings
+            # Try to use OpenAI embeddings if available
             openai_api_key = os.getenv("OPENAI_API_KEY")
             if openai_api_key and openai_api_key != "your_openai_api_key_here":
-                embedding_function = embedding_functions.OpenAIEmbeddingFunction(
+                logger.info("Using OpenAI embeddings for ChromaDB")
+                return embedding_functions.OpenAIEmbeddingFunction(
                     api_key=openai_api_key,
                     model_name="text-embedding-ada-002"
                 )
-                logger.info("Using OpenAI embeddings (text-embedding-ada-002)")
-                return embedding_function
-            
-            # Ultimate fallback to default
-            logger.warning("No embedding service configured, using default")
-            return embedding_functions.DefaultEmbeddingFunction()
+        except Exception as e:
+            logger.warning(f"OpenAI embedding setup failed: {e}")
+        
+        # Fallback to default sentence transformers
+        logger.info("Using default sentence transformer embeddings for ChromaDB")
+        return embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name="all-MiniLM-L6-v2"
+        )
     
-    def create_collection(self, session_id: str, reset_if_exists: bool = True):
-        """Create or get a collection for a session"""
+    def _load_existing_collections(self):
+        """Load existing collections from disk on startup"""
+        try:
+            existing_collections = self.client.list_collections()
+            logger.info(f"Found {len(existing_collections)} existing collections on disk")
+            
+            for collection_info in existing_collections:
+                collection_name = collection_info.name
+                
+                # Extract session_id from collection name
+                if collection_name.startswith("session_"):
+                    session_id = collection_name.replace("session_", "").replace("_", "-")
+                    
+                    try:
+                        # Get existing collection
+                        collection = self.client.get_collection(
+                            name=collection_name,
+                            embedding_function=self.embedding_function
+                        )
+                        
+                        self.collections[session_id] = collection
+                        document_count = collection.count()
+                        
+                        logger.info(f"✅ Loaded collection '{session_id}' with {document_count} documents")
+                        
+                    except Exception as e:
+                        logger.error(f"❌ Failed to load collection {collection_name}: {e}")
+                        
+        except Exception as e:
+            logger.error(f"❌ Failed to load existing collections: {e}")
+    
+    def get_or_create_collection(self, session_id: str):
+        """Get or create a collection for a session"""
         collection_name = f"session_{session_id}".replace("-", "_")
         
+        if session_id in self.collections:
+            return self.collections[session_id]
+        
         try:
-            if reset_if_exists:
-                # Delete existing collection if it exists
-                try:
-                    self.client.delete_collection(collection_name)
-                    logger.info(f"Deleted existing collection: {collection_name}")
-                except Exception:
-                    pass  # Collection didn't exist
-            
-            # Create new collection
-            collection = self.client.create_collection(
+            collection = self.client.get_or_create_collection(
                 name=collection_name,
                 embedding_function=self.embedding_function,
                 metadata={"session_id": session_id, "created_at": datetime.now().isoformat()}
             )
-            
             self.collections[session_id] = collection
-            logger.info(f"Created ChromaDB collection: {collection_name}")
+            logger.info(f"Created new collection for session: {session_id}")
             return collection
-            
         except Exception as e:
-            logger.error(f"Error creating collection: {e}")
-            # Try to get existing collection
-            try:
-                collection = self.client.get_collection(
-                    name=collection_name,
-                    embedding_function=self.embedding_function
-                )
-                self.collections[session_id] = collection
-                logger.info(f"Retrieved existing collection: {collection_name}")
-                return collection
-            except Exception as e2:
-                logger.error(f"Error retrieving collection: {e2}")
-                raise e
+            logger.error(f"Failed to create collection for session {session_id}: {e}")
+            return None
     
-    def add_documents(self, documents, session_id="default"):
-        """Add documents to ChromaDB collection"""
+    def add_documents(self, documents: List[Dict], session_id: str) -> bool:
+        """Add documents to ChromaDB for a session"""
         try:
-            # Get or create collection
-            if session_id not in self.collections:
-                self.create_collection(session_id)
+            collection = self.get_or_create_collection(session_id)
+            if not collection:
+                return False
             
-            collection = self.collections[session_id]
+            # Prepare documents for ChromaDB
+            ids = [str(uuid.uuid4()) for _ in range(len(documents))]
+            texts = [doc['content'] for doc in documents]
+            metadatas = [{"source": doc['source'], "chunk_id": doc.get('id', 0)} for doc in documents]
             
-            # Prepare data for ChromaDB
-            doc_texts = []
-            doc_metadatas = []
-            doc_ids = []
-            
-            for i, doc in enumerate(documents):
-                doc_id = f"{session_id}_{i}_{uuid.uuid4().hex[:8]}"
-                
-                doc_texts.append(doc['content'])
-                doc_metadatas.append({
-                    'source': doc.get('source', 'unknown'),
-                    'chunk_id': doc.get('id', i),
-                    'word_count': len(doc['content'].split()),
-                    'char_count': len(doc['content']),
-                    'added_at': datetime.now().isoformat()
-                })
-                doc_ids.append(doc_id)
-            
-            # Add to ChromaDB (embeddings generated automatically)
             collection.add(
-                documents=doc_texts,
-                metadatas=doc_metadatas,
-                ids=doc_ids
+                ids=ids,
+                documents=texts,
+                metadatas=metadatas
             )
             
-            logger.info(f"Added {len(documents)} documents to ChromaDB collection")
+            logger.info(f"Added {len(documents)} documents to session {session_id}")
             return True
-            
         except Exception as e:
-            logger.error(f"Error adding documents to ChromaDB: {e}")
+            logger.error(f"Failed to add documents to ChromaDB: {e}")
             return False
     
-    def search(self, query, k=3):
-        """Search documents using ChromaDB semantic search"""
-        # Keep the same method signature for compatibility
-        return self.search_advanced("default", query, k)
-    
-    def search_advanced(self, session_id, query, k=3, filters=None):
-        """Advanced search with session and filters"""
+    def search_advanced(self, session_id: str, query: str, k: int = 5) -> List[Dict]:
+        """Search for relevant documents using ChromaDB"""
+        if session_id not in self.collections:
+            return []
+        
         try:
-            if session_id not in self.collections:
-                logger.warning(f"No collection found for session {session_id}")
-                return []
-            
             collection = self.collections[session_id]
-            
-            # Perform semantic search
             results = collection.query(
                 query_texts=[query],
                 n_results=k,
-                where=filters  # Optional metadata filtering
+                include=["documents", "metadatas", "distances"]
             )
             
-            # Format results to match existing interface
-            formatted_results = []
+            # Format results
+            documents = []
+            if results and results['documents']:
+                for i, (doc, metadata, distance) in enumerate(zip(
+                    results['documents'][0],
+                    results['metadatas'][0],
+                    results['distances'][0]
+                )):
+                    # Convert distance to similarity score (1/(1+distance))
+                    similarity_score = 1 / (1 + distance) if distance is not None else 0.5
+                    
+                    documents.append({
+                        'content': doc,
+                        'source': metadata.get('source', 'unknown'),
+                        'similarity_score': similarity_score,
+                        'chunk_id': metadata.get('chunk_id', i)
+                    })
             
-            if results['documents'] and results['documents'][0]:
-                for i in range(len(results['documents'][0])):
-                    result = {
-                        'id': results['ids'][0][i],
-                        'content': results['documents'][0][i],
-                        'similarity_score': 1.0 - results['distances'][0][i],  # Convert distance to similarity
-                        'source': results['metadatas'][0][i].get('source', 'unknown') if results['metadatas'][0] else 'unknown'
-                    }
-                    formatted_results.append(result)
-            
-            logger.info(f"ChromaDB search returned {len(formatted_results)} results")
-            return formatted_results
-            
+            return documents
         except Exception as e:
-            logger.error(f"Error searching ChromaDB: {e}")
+            logger.error(f"ChromaDB search failed: {e}")
             return []
+        
 # Advanced text chunking
 class SemanticChunker:
     """Advanced text chunking based on semantic boundaries"""
@@ -442,6 +475,7 @@ class RAGEvaluator:
 document_stores = {}
 chroma_store = ChromaDocumentStore()
 conversation_history = ConversationHistory()
+conversation_cache = ConversationCache()  # ADD THIS LINE
 evaluator = RAGEvaluator()
 
 # Enhanced web scraper
@@ -738,10 +772,11 @@ async def upload_document(file: UploadFile = File(...)):
 
 @app.post("/ask", response_model=AnswerResponse)
 async def ask_question_enhanced(request: QuestionRequest):
-    """Enhanced question answering with conversation memory and evaluation"""
+    """Enhanced question answering with conversation memory, evaluation, and caching"""
     try:
         session_id = request.session_id or "default"
         logger.info(f"Processing enhanced question: {request.question}")
+        
         # Check if collection exists
         if session_id not in chroma_store.collections:
             return AnswerResponse(
@@ -751,7 +786,7 @@ async def ask_question_enhanced(request: QuestionRequest):
             )
         
         relevant_docs = chroma_store.search_advanced(session_id, request.question, k=4)
-        logger.info(f"Found {len(relevant_docs)} relevant documents using hybrid search")
+        logger.info(f"Found {len(relevant_docs)} relevant documents using ChromaDB search")
         
         if not relevant_docs:
             return AnswerResponse(
@@ -764,17 +799,31 @@ async def ask_question_enhanced(request: QuestionRequest):
         sources = list(set([doc['source'] for doc in relevant_docs]))
         relevance_scores = [doc.get('similarity_score', 0) for doc in relevant_docs]
         
-        conversation_context = ""
-        if request.use_conversation_history:
-            conversation_context = conversation_history.get_context(session_id)
+        # Check cache first (avoid OpenAI call if possible)
+        context_snippet = context[:200]  # Use snippet for cache key
+        cached_result = conversation_cache.get_cached_answer(request.question, context_snippet)
         
-        logger.info(f"Context length: {len(context)} characters")
-        logger.info(f"Using conversation history: {bool(conversation_context)}")
-        
-        # Get enhanced answer from OpenAI
-        logger.info("Calling enhanced OpenAI API...")
-        answer = call_openai_api_enhanced(request.question, context, conversation_context)
-        logger.info("Enhanced OpenAI response received")
+        if cached_result:
+            answer = cached_result['answer']
+            logger.info("✅ Using cached answer - no OpenAI call needed")
+        else:
+            # Get conversation context
+            conversation_context = ""
+            if request.use_conversation_history:
+                conversation_context = conversation_history.get_context(session_id)
+            
+            logger.info(f"Context length: {len(context)} characters")
+            logger.info(f"Using conversation history: {bool(conversation_context)}")
+            
+            # Get answer from OpenAI (only if not cached)
+            logger.info("Calling OpenAI API for new answer...")
+            answer = call_openai_api_enhanced(request.question, context, conversation_context)
+            logger.info("OpenAI response received")
+            
+            # Cache the answer for future use
+            conversation_cache.cache_answer(
+                request.question, answer, sources, context_snippet
+            )
         
         # Evaluate the response
         metrics = evaluator.evaluate_response(request.question, answer, relevant_docs)
@@ -801,6 +850,7 @@ async def ask_question_enhanced(request: QuestionRequest):
             sources=[],
             session_id=request.session_id or "default"
         )
+
 
 @app.get("/conversation/{session_id}")
 async def get_conversation_history(session_id: str = "default"):
@@ -839,6 +889,75 @@ async def health_check():
         "supported_formats": ["web_pages", "pdf", "docx", "xlsx", "txt", "md"],
         "version": "2.0.0 + ChromaDB"
     }
+
+@app.get("/debug/persistence")
+async def debug_persistence():
+    """Debug ChromaDB persistence"""
+    
+    # Check if data directory exists
+    data_dir = chroma_store.persist_directory
+    dir_exists = os.path.exists(data_dir)
+    
+    if dir_exists:
+        files = os.listdir(data_dir)
+        file_count = len(files)
+    else:
+        files = []
+        file_count = 0
+    
+    # Check collections
+    try:
+        collections = chroma_store.client.list_collections()
+        collection_info = []
+        total_docs = 0
+        
+        for collection in collections:
+            count = collection.count()
+            total_docs += count
+            collection_info.append({
+                "name": collection.name,
+                "documents": count,
+                "metadata": collection.metadata
+            })
+    except Exception as e:
+        collection_info = [{"error": str(e)}]
+        total_docs = 0
+    
+    return {
+        "persistence_directory": {
+            "path": data_dir,
+            "exists": dir_exists,
+            "files": files,
+            "file_count": file_count
+        },
+        "collections": collection_info,
+        "total_documents": total_docs,
+        "loaded_sessions": list(chroma_store.collections.keys()),
+        "cache_size": len(conversation_cache.cache)
+    }
+
+@app.get("/debug/cache")
+async def debug_cache():
+    """Debug conversation cache"""
+    return {
+        "cached_questions": len(conversation_cache.cache),
+        "cache_details": [
+            {
+                "question": item["question"][:100] + "...",
+                "cached_at": item["cached_at"],
+                "sources_count": len(item["sources"])
+            }
+            for item in conversation_cache.cache.values()
+        ]
+    }
+
+@app.delete("/debug/clear_cache")
+async def clear_cache():
+    """Clear conversation cache"""
+    conversation_cache.clear_cache()
+    return {"message": "Cache cleared successfully"}
+
+
 @app.delete("/clear/{session_id}")
 async def clear_session_enhanced(session_id: str = "default"):
     """Clear session with ChromaDB"""

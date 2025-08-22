@@ -199,79 +199,113 @@ def add_chromadb_class(content):
             logger.warning("No embedding service configured, using default")
             return embedding_functions.DefaultEmbeddingFunction()
     
-    def create_collection(self, session_id: str, reset_if_exists: bool = True):
-        """Create or get a collection for a session"""
-        collection_name = f"session_{session_id}".replace("-", "_")
+   def get_or_create_collection(self, session_id: str, reset_if_exists: bool = False):
+    """Get existing collection or create new one - PRESERVES DATA by default"""
+    collection_name = f"session_{session_id}".replace("-", "_")
+    
+    try:
+        # Check if we already have this collection loaded
+        if session_id in self.collections and not reset_if_exists:
+            document_count = self.collections[session_id].count()
+            logger.info(f"✅ Using existing loaded collection: {collection_name} ({document_count} docs)")
+            return self.collections[session_id]
         
-        try:
-            if reset_if_exists:
-                try:
-                    self.client.delete_collection(collection_name)
-                    logger.info(f"Deleted existing collection: {collection_name}")
-                except Exception:
-                    pass
-            
-            collection = self.client.create_collection(
-                name=collection_name,
-                embedding_function=self.embedding_function,
-                metadata={"session_id": session_id, "created_at": datetime.now().isoformat()}
-            )
-            
-            self.collections[session_id] = collection
-            logger.info(f"Created ChromaDB collection: {collection_name}")
-            return collection
-            
-        except Exception as e:
-            logger.error(f"Error creating collection: {e}")
+        # Try to get existing collection first (PRESERVE DATA)
+        if not reset_if_exists:
             try:
                 collection = self.client.get_collection(
                     name=collection_name,
                     embedding_function=self.embedding_function
                 )
                 self.collections[session_id] = collection
-                logger.info(f"Retrieved existing collection: {collection_name}")
+                document_count = collection.count()
+                logger.info(f"✅ Retrieved existing collection '{collection_name}' with {document_count} documents")
                 return collection
-            except Exception as e2:
-                logger.error(f"Error retrieving collection: {e2}")
-                raise e
+                
+            except Exception:
+                logger.info(f"Collection '{collection_name}' doesn't exist, creating new one")
+        
+        # Delete existing if reset requested
+        if reset_if_exists:
+            try:
+                self.client.delete_collection(collection_name)
+                logger.info(f"🗑️ Deleted existing collection: {collection_name}")
+            except Exception:
+                pass  # Collection didn't exist
+        
+        # Create new collection
+        collection = self.client.create_collection(
+            name=collection_name,
+            embedding_function=self.embedding_function,
+            metadata={
+                "session_id": session_id, 
+                "created_at": datetime.now().isoformat(),
+                "version": "2.0"
+            }
+        )
+        
+        self.collections[session_id] = collection
+        logger.info(f"✅ Created new collection: {collection_name}")
+        return collection
+        
+    except Exception as e:
+        logger.error(f"❌ Error with collection {collection_name}: {e}")
+        raise e
+
+
+
     
     def add_documents(self, documents, session_id="default"):
-        """Add documents to ChromaDB collection"""
-        try:
-            if session_id not in self.collections:
-                self.create_collection(session_id)
+    """Add documents with persistence verification"""
+    try:
+        logger.info(f"📝 Adding {len(documents)} documents to session '{session_id}'")
+        
+        # Get or create collection (preserve existing data)
+        collection = self.get_or_create_collection(session_id, reset_if_exists=False)
+        
+        # Check existing document count
+        before_count = collection.count()
+        logger.info(f"Collection had {before_count} documents before adding")
+        
+        # Prepare documents for ChromaDB
+        doc_texts = []
+        doc_metadatas = []
+        doc_ids = []
+        
+        for i, doc in enumerate(documents):
+            # Create unique ID with timestamp to avoid conflicts
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            doc_id = f"{session_id}_{timestamp}_{i}_{uuid.uuid4().hex[:8]}"
             
-            collection = self.collections[session_id]
-            
-            doc_texts = []
-            doc_metadatas = []
-            doc_ids = []
-            
-            for i, doc in enumerate(documents):
-                doc_id = f"{session_id}_{i}_{uuid.uuid4().hex[:8]}"
-                
-                doc_texts.append(doc['content'])
-                doc_metadatas.append({
-                    'source': doc.get('source', 'unknown'),
-                    'chunk_id': doc.get('id', i),
-                    'word_count': len(doc['content'].split()),
-                    'char_count': len(doc['content']),
-                    'added_at': datetime.now().isoformat()
-                })
-                doc_ids.append(doc_id)
-            
-            collection.add(
-                documents=doc_texts,
-                metadatas=doc_metadatas,
-                ids=doc_ids
-            )
-            
-            logger.info(f"Added {len(documents)} documents to ChromaDB collection")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error adding documents to ChromaDB: {e}")
-            return False
+            doc_texts.append(doc['content'])
+            doc_metadatas.append({
+                'source': doc.get('source', 'unknown'),
+                'chunk_id': doc.get('id', i),
+                'word_count': len(doc['content'].split()),
+                'char_count': len(doc['content']),
+                'added_at': datetime.now().isoformat(),
+                'session_id': session_id
+            })
+            doc_ids.append(doc_id)
+        
+        # Add to ChromaDB
+        collection.add(
+            documents=doc_texts,
+            metadatas=doc_metadatas,
+            ids=doc_ids
+        )
+        
+        # Verify persistence
+        after_count = collection.count()
+        added_count = after_count - before_count
+        
+        logger.info(f"✅ Successfully added {added_count} documents (total: {after_count})")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Error adding documents: {e}")
+        return False
     
     def search(self, query, k=3):
         """Search documents using ChromaDB semantic search"""
