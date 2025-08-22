@@ -1,0 +1,2 @@
+Requirement already satisfied: scipy in d:\projects\ai\website reader\.venv\lib\site-packages (1.15.3)
+Requirement already satisfied: numpy<2.5,>=1.23.5 in d:\projects\ai\website reader\.venv\lib\site-packages (from scipy) (1.26.4)
